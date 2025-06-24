@@ -1,0 +1,47 @@
+{
+  "field_mappings": {
+    "name": "name",
+    "label": "name", 
+    "description": "description",
+    "web_short_description": "description",
+    "web_extended_description": "web-extended-description-2",
+    "safety_data_sheet": "safety-data-sheet"
+  },
+  "matching_strategy": "sku",
+  "image_mapping": {
+    "discover_automatically": true,
+    "primary_image_field": "thumbnail",
+    "gallery_images_field": "asset_ids",
+    "webflow_image_field": "main-image",
+    "discovered_fields": {}
+  },
+  "pdf_file_fields": [
+    "safety_data_sheet",
+    "specification_sheet"
+  ],
+  "description_fields": [
+    "web_extended_description",
+    "web_short_description"
+  ],
+  "sku_level_fields": [
+    "sku",
+    "price",
+    "inventory",
+    "main_image",
+    "thumbnail",
+    "user_thumb"
+  ],
+  "product_level_fields": [
+    "name",
+    "title",
+    "label",
+    "description",
+    "web_short_description", 
+    "web_extended_description",
+    "content",
+    "short_description",
+    "safety_data_sheet",
+    "specification_sheet",
+    "regular_price"
+  ]
+}
