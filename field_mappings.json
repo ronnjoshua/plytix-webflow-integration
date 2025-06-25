@@ -2,10 +2,12 @@
   "field_mappings": {
     "name": "name",
     "label": "name", 
+    "price": "price",
     "description": "description",
     "web_short_description": "description",
     "web_extended_description": "web-extended-description-2",
-    "safety_data_sheet": "safety-data-sheet"
+    "safety_data_sheet": "safety-data-sheet",
+    "specification_sheet": "specification-sheet"
   },
   "matching_strategy": "sku",
   "image_mapping": {

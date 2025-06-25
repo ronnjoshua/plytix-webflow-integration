@@ -363,3 +363,22 @@ class AssetHandler:
             filename = name[:90] + '.' + ext
         
         return filename
+    
+    def process_asset_from_attribute(self, asset_data: Any, asset_type: str) -> Optional[Dict[str, Any]]:
+        """Process asset from attribute data for direct URL usage"""
+        try:
+            if asset_type == "file":
+                # Process file/PDF data
+                file_info = self._extract_file_info(asset_data)
+                if file_info:
+                    return self._format_direct_file_link(file_info)
+            elif asset_type == "image":
+                # Process image data
+                image_url = self._extract_image_url(asset_data)
+                if image_url and not self._is_placeholder_image(image_url):
+                    return self._format_direct_image_link(image_url)
+            
+            return None
+        except Exception as e:
+            logger.error(f"Error processing {asset_type} from attribute", error=str(e))
+            return None
