@@ -174,11 +174,26 @@ class SyncService:
             product, sku_properties, sku_matrix, webflow_data
         )
         
+        # DEBUG LOGGING: Print out SKU and price values being sent to Webflow
+        logger.warning("DEBUG: WebflowProduct SKUs and prices", 
+            product_sku=product.sku,
+            webflow_skus=[{
+                'sku': sku.sku,
+                'price_cents': sku.price.value if hasattr(sku, 'price') and hasattr(sku.price, 'value') else None
+            } for sku in webflow_product.skus]
+        )
+        
         # Check if product exists in Webflow using SKU-based matching
         product_sku = self.field_mapping_service.get_sku_from_product(product.__dict__)
         existing_product = await self.webflow_client.get_product_by_sku(
             product_sku, collection_id=target_collection_id
         )
+
+        if not existing_product:
+            logger.info("Skipping product - not found in Webflow", 
+                        sku=product.sku,
+                        message="Product does not exist in Webflow. Skipping sync.")
+            return False
         
         try:
             if existing_product:

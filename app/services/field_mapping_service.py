@@ -130,47 +130,59 @@ class FieldMappingService:
         
         # PRIORITY: Check for real images from assets API first
         if 'real_main_image' in product_data:
-            discovered_images['real_main_image'] = 'main-image'
             logger.info("Discovered REAL image from assets API", 
-                       field='real_main_image')
+                       field='real_main_image', value=product_data['real_main_image'])
+            discovered_images['real_main_image'] = 'main-image'
         
         for field_name, field_value in product_data.items():
             # Skip the real_main_image as it's already handled above
             if field_name == 'real_main_image':
                 continue
-                
+            
+            logger.debug("Checking field for image", plytix_field=field_name, value_preview=str(field_value)[:100])
             if self._is_image_field(field_name, field_value):
                 # Map to appropriate Webflow field
                 webflow_field = self._map_image_field(field_name)
                 discovered_images[field_name] = webflow_field
-                
                 logger.debug("Discovered image field", 
                            plytix_field=field_name, 
-                           webflow_field=webflow_field)
+                           webflow_field=webflow_field, value_preview=str(field_value)[:100])
+            else:
+                logger.debug("Field is not an image or was skipped", plytix_field=field_name, value_preview=str(field_value)[:100])
         
         return discovered_images
     
     def _is_image_field(self, field_name: str, field_value: Any) -> bool:
-        """Check if a field contains image data"""
+        """Check if a field contains image data, with extra logging"""
         if not field_value:
+            logger.debug("Image field is empty or None", plytix_field=field_name)
             return False
-            
+        
         field_lower = field_name.lower()
         
         # Check field name patterns
         if any(keyword in field_lower for keyword in ['image', 'photo', 'picture', 'img', 'gallery']):
+            logger.debug("Field name pattern matches image", plytix_field=field_name)
             return True
         
         # Check field value patterns (URLs, file extensions)
         if isinstance(field_value, str):
-            return any(ext in field_value.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg'])
+            if any(ext in field_value.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg']):
+                if "static.plytix.com/template" in field_value or "default" in field_value.lower():
+                    logger.debug("Skipping placeholder image", plytix_field=field_name, url=field_value)
+                    return False
+                logger.debug("Field value is a valid image URL", plytix_field=field_name, url=field_value)
+                return True
         
         # Check if it's a list of image URLs
         if isinstance(field_value, list) and field_value:
             first_item = field_value[0]
             if isinstance(first_item, str):
-                return any(ext in first_item.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp'])
+                if any(ext in first_item.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+                    logger.debug("Field value is a list of image URLs", plytix_field=field_name, url=first_item)
+                    return True
         
+        logger.debug("Field is not recognized as image", plytix_field=field_name, value_preview=str(field_value)[:100])
         return False
     
     def _map_image_field(self, plytix_field: str) -> str:
@@ -464,15 +476,15 @@ class FieldMappingService:
             return value.strip()
         return str(value) if value is not None else ""
     
-    def _transform_number_value(self, value: Any) -> Optional[float]:
-        """Transform numeric field values"""
+    def _transform_number_value(self, value: Any) -> Optional[int]:
+        """Transform numeric field values to integer cents for Webflow"""
         if isinstance(value, (int, float)):
-            return float(value)
+            return int(float(value) * 100)  # Convert to cents
         elif isinstance(value, str):
             try:
                 # Remove currency symbols and commas
                 cleaned = value.replace('$', '').replace(',', '').strip()
-                return float(cleaned)
+                return int(float(cleaned) * 100)
             except ValueError:
                 return None
         return None

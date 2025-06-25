@@ -343,6 +343,21 @@ class WebflowClient:
                    total_fields_changed=len(changed_fields),
                    total_fields_checked=len(field_data))
         
+        # Guarantee price is always an object in PATCH body with value, unit, and currency (product-level)
+        if "price" in request_body["product"]["fieldData"]:
+            price_val = request_body["product"]["fieldData"]["price"]
+            if isinstance(price_val, dict):
+                price_val["unit"] = price_val.get("unit", "USD")
+                price_val["currency"] = price_val.get("currency", "USD")
+            elif isinstance(price_val, (int, float)):
+                request_body["product"]["fieldData"]["price"] = {
+                    "value": int(price_val),
+                    "unit": "USD",
+                    "currency": "USD"
+                }
+            else:
+                del request_body["product"]["fieldData"]["price"]
+        
         logger.debug("Webflow update product request", endpoint=endpoint, body_structure=list(request_body.keys()), field_count=len(fields_to_update))
         data = await self._make_request(endpoint, method="PATCH", json_data=request_body)
         
@@ -384,13 +399,10 @@ class WebflowClient:
                         "fieldData": {}
                     }
                     
-                    # Compare and map SKU fields based on schema
+                    # Always include the 'sku' property in the PATCH request body
                     if sku_data.get("sku"):
-                        current_sku_value = current_sku_fields.get("sku", "")
-                        new_sku_value = str(sku_data["sku"]).strip()
-                        if new_sku_value != str(current_sku_value).strip():
-                            sku_update["fieldData"]["sku"] = sku_data["sku"]
-                            updated_fields.append("sku")
+                        sku_update["fieldData"]["sku"] = sku_data["sku"]
+                        updated_fields.append("sku")
                     
                     if sku_data.get("price"):
                         current_price = current_sku_fields.get("price", {})
@@ -408,12 +420,24 @@ class WebflowClient:
                             sku_update["fieldData"]["price"] = new_price
                             updated_fields.append("price")
                     
-                    if sku_data.get("inventory"):
-                        current_inventory = current_sku_fields.get("inventory")
-                        new_inventory = sku_data["inventory"]
-                        if str(new_inventory).strip() != str(current_inventory or "").strip():
-                            sku_update["fieldData"]["inventory"] = new_inventory
-                            updated_fields.append("inventory")
+                    # Remove inventory from fieldData if present
+                    if "inventory" in sku_update["fieldData"]:
+                        del sku_update["fieldData"]["inventory"]
+                    
+                    # Guarantee price is always an object in PATCH body with value, unit, and currency (SKU-level)
+                    if "price" in sku_update["fieldData"]:
+                        price_val = sku_update["fieldData"]["price"]
+                        if isinstance(price_val, dict):
+                            price_val["unit"] = price_val.get("unit", "USD")
+                            price_val["currency"] = price_val.get("currency", "USD")
+                        elif isinstance(price_val, (int, float)):
+                            sku_update["fieldData"]["price"] = {
+                                "value": int(price_val),
+                                "unit": "USD",
+                                "currency": "USD"
+                            }
+                        else:
+                            del sku_update["fieldData"]["price"]
                     
                     # Handle SKU-level field mappings from Plytix data
                     if plytix_product_data:
@@ -466,9 +490,16 @@ class WebflowClient:
                                            new_value=str(new_value)[:50],
                                            current_value=str(current_value or "")[:50])
                     
+                    # Build PATCH body as required by Webflow API
+                    sku_patch_body = {
+                        "sku": {
+                            "id": default_sku_id,
+                            "fieldData": sku_update["fieldData"]
+                        }
+                    }
                     if updated_fields:
-                        logger.debug("Updating SKU", sku_id=default_sku_id, fields=updated_fields)
-                        await self._make_request(sku_endpoint, method="PATCH", json_data=sku_update)
+                        logger.debug("Updating SKU (Webflow PATCH body)", sku_id=default_sku_id, patch_body=sku_patch_body)
+                        await self._make_request(sku_endpoint, method="PATCH", json_data=sku_patch_body)
                     else:
                         logger.debug("No SKU changes detected - skipping SKU update", sku_id=default_sku_id)
                     
