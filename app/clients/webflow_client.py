@@ -424,21 +424,6 @@ class WebflowClient:
                     if "inventory" in sku_update["fieldData"]:
                         del sku_update["fieldData"]["inventory"]
                     
-                    # Guarantee price is always an object in PATCH body with value, unit, and currency (SKU-level)
-                    if "price" in sku_update["fieldData"]:
-                        price_val = sku_update["fieldData"]["price"]
-                        if isinstance(price_val, dict):
-                            price_val["unit"] = price_val.get("unit", "USD")
-                            price_val["currency"] = price_val.get("currency", "USD")
-                        elif isinstance(price_val, (int, float)):
-                            sku_update["fieldData"]["price"] = {
-                                "value": int(price_val),
-                                "unit": "USD",
-                                "currency": "USD"
-                            }
-                        else:
-                            del sku_update["fieldData"]["price"]
-                    
                     # Handle SKU-level field mappings from Plytix data
                     if plytix_product_data:
                         from app.services.field_mapping_service import FieldMappingService
@@ -489,6 +474,21 @@ class WebflowClient:
                                            sku_id=default_sku_id, 
                                            new_value=str(new_value)[:50],
                                            current_value=str(current_value or "")[:50])
+                    
+                    # FINAL guarantee: price is always an object in PATCH body (SKU-level)
+                    if "price" in sku_update["fieldData"]:
+                        price_val = sku_update["fieldData"]["price"]
+                        if isinstance(price_val, dict):
+                            price_val["unit"] = price_val.get("unit", "USD")
+                            price_val["currency"] = price_val.get("currency", "USD")
+                        elif isinstance(price_val, (int, float)):
+                            sku_update["fieldData"]["price"] = {
+                                "value": int(price_val),
+                                "unit": "USD",
+                                "currency": "USD"
+                            }
+                        else:
+                            del sku_update["fieldData"]["price"]
                     
                     # Build PATCH body as required by Webflow API
                     sku_patch_body = {
