@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import crontab
 from app.config.settings import get_settings
 
 settings = get_settings()
@@ -31,12 +32,12 @@ celery_app.conf.update(
 celery_app.conf.beat_schedule = {
     "sync-products-production": {
         "task": "app.tasks.sync_tasks.run_scheduled_sync",
-        "schedule": settings.SYNC_SCHEDULE_PRODUCTION,
+        "schedule": crontab(minute=0, hour=0, day_of_month='*/2'),  # Every 2 days at midnight
         "kwargs": {"test_mode": False}
     },
     "sync-products-testing": {
         "task": "app.tasks.sync_tasks.run_scheduled_sync", 
-        "schedule": settings.SYNC_SCHEDULE_TESTING,
+        "schedule": crontab(minute='*/5'),  # Every 5 minutes (changed from every minute to reduce load)
         "kwargs": {"test_mode": True}
     },
 }
