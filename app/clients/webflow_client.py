@@ -1,4 +1,5 @@
 import httpx
+import json
 from typing import List, Optional, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 import structlog
@@ -60,6 +61,13 @@ class WebflowClient:
             "Accept": "application/json"
         }
         
+        # Log request details for debugging (excluding sensitive data)
+        logger.debug("Sending request to Webflow API", 
+                    method=method,
+                    url=url.replace(self.token, "***") if self.token in url else url,
+                    has_json_data=bool(json_data),
+                    params=params)
+        
         try:
             response = await self._client.request(
                 method=method,
@@ -68,6 +76,12 @@ class WebflowClient:
                 json=json_data,
                 params=params
             )
+            
+            # Log response status for debugging
+            logger.debug("Received response from Webflow API",
+                        status_code=response.status_code,
+                        content_length=len(response.text) if response.text else 0)
+            
             response.raise_for_status()
             return response.json()
                 
@@ -231,13 +245,35 @@ class WebflowClient:
             # Transform data - this now returns ONLY product-level fields
             transformed_data = field_mapping_service.transform_product_data(mock_product)
             
+            # FORCE INCLUDE: Explicitly check for cleared PDF fields and add them
+            pdf_fields_to_check = ['safety_data_sheet', 'specification_sheet']
+            pdf_webflow_fields = ['safety-data-sheet', 'specification-sheet']
+            
+            for i, plytix_field in enumerate(pdf_fields_to_check):
+                webflow_field = pdf_webflow_fields[i]
+                if webflow_field not in transformed_data:  # Field wasn't included by normal transform
+                    # Check if field exists but is empty in Plytix data
+                    raw_value = plytix_product_data.get(plytix_field)
+                    if plytix_field in plytix_product_data and (raw_value is None or raw_value == "" or str(raw_value).lower() == 'none'):
+                        transformed_data[webflow_field] = ""
+                        logger.info("Including cleared PDF field in update", 
+                                   plytix_field=plytix_field,
+                                   webflow_field=webflow_field,
+                                   reason="PDF field cleared in Plytix")
+            
             # Add transformed fields to field_data (already filtered to product-level only)
             for webflow_field, value in transformed_data.items():
-                if value is not None and str(value).strip() != "":
+                # Allow empty strings for PDF fields (to clear them in Webflow)
+                pdf_fields = ['safety-data-sheet', 'specification-sheet']
+                if (value is not None and str(value).strip() != "") or (webflow_field in pdf_fields and value == ""):
                     field_data[webflow_field] = value
-                    logger.debug("Mapped product-level field from Plytix data", 
-                               webflow_field=webflow_field,
-                               value_preview=str(value)[:50] + ("..." if len(str(value)) > 50 else ""))
+                    if value == "":
+                        logger.info("Including empty PDF field to clear in Webflow", 
+                                   webflow_field=webflow_field)
+                    else:
+                        logger.debug("Mapped product-level field from Plytix data", 
+                                   webflow_field=webflow_field,
+                                   value_preview=str(value)[:50] + ("..." if len(str(value)) > 50 else ""))
         else:
             # Fallback to original logic using WebflowProduct data
             from app.utils.field_separator import WebflowFieldSeparator
@@ -357,6 +393,13 @@ class WebflowClient:
                 }
             else:
                 del request_body["product"]["fieldData"]["price"]
+        
+        # Log the request details for debugging
+        logger.debug("Webflow PATCH request details", 
+                    endpoint=endpoint, 
+                    product_id=product_id,
+                    field_count=len(fields_to_update),
+                    fields_being_updated=list(fields_to_update.keys()))
         
         logger.debug("Webflow update product request", endpoint=endpoint, body_structure=list(request_body.keys()), field_count=len(fields_to_update))
         data = await self._make_request(endpoint, method="PATCH", json_data=request_body)

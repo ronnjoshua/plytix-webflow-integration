@@ -37,7 +37,8 @@
       "Bash(./start-production.sh:*)",
       "Bash(open:*)",
       "WebFetch(domain:docs.plytix.com)",
-      "Bash(sed:*)"
+      "Bash(sed:*)",
+      "WebFetch(domain:docs.developers.webflow.com)"
     ],
     "deny": []
   }

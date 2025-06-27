@@ -33,6 +33,7 @@ class FieldMapping:
     required: bool = False
     transform_function: Optional[str] = None
     default_value: Optional[Any] = None
+    clearable: bool = False  # Whether this field can be auto-cleared when removed from Plytix
 
 class FieldMappingService:
     """Enhanced field mapping service with automatic discovery and validation"""
@@ -75,11 +76,15 @@ class FieldMappingService:
         for plytix_field, webflow_field in mappings.items():
             field_type = self._detect_field_type(plytix_field)
             
+            # Set clearable flag for PDF fields
+            clearable = field_type == FieldType.PDF
+            
             self.field_mappings[plytix_field] = FieldMapping(
                 plytix_field=plytix_field,
                 webflow_field=webflow_field,
                 field_type=field_type,
-                required=plytix_field in ['sku', 'name', 'price']
+                required=plytix_field in ['sku', 'name', 'price'],
+                clearable=clearable
             )
     
     def _process_image_mappings(self, image_config: Dict[str, Any]) -> None:
@@ -116,13 +121,105 @@ class FieldMappingService:
             'name': FieldMapping('name', 'name', FieldType.TEXT, required=True),
             'description': FieldMapping('description', 'description', FieldType.RICH_TEXT),
             'price': FieldMapping('price', 'price', FieldType.NUMBER),
-            'safety_data_sheet': FieldMapping('safety_data_sheet', 'safety-data-sheet', FieldType.PDF),
-            'specification_sheet': FieldMapping('specification_sheet', 'specification-sheet', FieldType.PDF),
+            'safety_data_sheet': FieldMapping('safety_data_sheet', 'safety-data-sheet', FieldType.PDF, clearable=True),
+            'specification_sheet': FieldMapping('specification_sheet', 'specification-sheet', FieldType.PDF, clearable=True),
             'web_extended_description': FieldMapping('web_extended_description', 'web-extended-description', FieldType.RICH_TEXT)
         }
         
         self.field_mappings.update(default_mappings)
         logger.info("Default field mappings created", total=len(default_mappings))
+    
+    def _should_clear_field(self, plytix_field: str, raw_value: Any, mapping: FieldMapping, 
+                           all_data: Dict[str, Any]) -> bool:
+        """
+        Safely determine if a field should be cleared in Webflow.
+        Uses conservative approach with explicit validation.
+        """
+        logger.debug("Evaluating field for clearing", 
+                    plytix_field=plytix_field,
+                    field_type=mapping.field_type.value,
+                    clearable=mapping.clearable,
+                    required=mapping.required,
+                    raw_value_type=type(raw_value).__name__,
+                    raw_value_preview=str(raw_value)[:100] if raw_value else "None")
+        
+        # Only consider clearing if the field is explicitly marked as clearable
+        if not mapping.clearable:
+            logger.debug("Field not clearable", plytix_field=plytix_field)
+            return False
+        
+        # Don't clear required fields
+        if mapping.required:
+            logger.debug("Field is required, not clearing", plytix_field=plytix_field)
+            return False
+        
+        # Only clear PDF fields for now (conservative approach)
+        if mapping.field_type != FieldType.PDF:
+            logger.debug("Field is not PDF type, not clearing", 
+                        plytix_field=plytix_field, 
+                        field_type=mapping.field_type.value)
+            return False
+        
+        # Check if field exists but is explicitly empty/null
+        field_exists_but_empty = (
+            plytix_field in all_data and 
+            (all_data[plytix_field] is None or 
+             all_data[plytix_field] == "" or 
+             (isinstance(all_data[plytix_field], dict) and not any(all_data[plytix_field].values())))
+        )
+        
+        logger.debug("PDF field clearing evaluation", 
+                    plytix_field=plytix_field,
+                    field_exists_in_data=plytix_field in all_data,
+                    field_value=all_data.get(plytix_field, "NOT_FOUND"),
+                    field_exists_but_empty=field_exists_but_empty)
+        
+        # Additional safety checks for PDF fields
+        if mapping.field_type == FieldType.PDF and field_exists_but_empty:
+            logger.info("PDF field will be cleared in Webflow", 
+                       plytix_field=plytix_field,
+                       webflow_field=mapping.webflow_field,
+                       reason="Field exists but is explicitly empty")
+            return True
+        
+        logger.debug("Field not being cleared", 
+                    plytix_field=plytix_field,
+                    reason="Does not meet clearing criteria")
+        return False
+    
+    def _force_include_cleared_pdf_fields(self, all_mapped_fields: Dict[str, Any], combined_dict: Dict[str, Any]) -> None:
+        """
+        Force inclusion of cleared PDF fields with empty strings.
+        This ensures PDF fields are sent to Webflow even when they're empty in Plytix.
+        """
+        logger.debug("Checking for cleared PDF fields to include", 
+                    combined_dict_size=len(combined_dict),
+                    current_mapped_fields=len(all_mapped_fields))
+        
+        pdf_fields_to_check = ['safety_data_sheet', 'specification_sheet']
+        
+        for plytix_field in pdf_fields_to_check:
+            if plytix_field in self.field_mappings:
+                mapping = self.field_mappings[plytix_field]
+                webflow_field = mapping.webflow_field
+                
+                # Check if field is already processed
+                if webflow_field not in all_mapped_fields:
+                    # Check if field exists but is empty/cleared in Plytix
+                    raw_value = combined_dict.get(plytix_field)
+                    
+                    # If field exists but is empty/null, force include with empty string
+                    if (plytix_field in combined_dict and 
+                        (raw_value is None or 
+                         raw_value == "" or 
+                         str(raw_value).lower() == 'none' or
+                         (isinstance(raw_value, dict) and not any(raw_value.values())))):
+                        
+                        all_mapped_fields[webflow_field] = ""
+                        logger.info("Including cleared PDF field for Webflow update", 
+                                   plytix_field=plytix_field,
+                                   webflow_field=webflow_field,
+                                   reason="PDF field cleared in Plytix")
     
     def discover_image_fields(self, product_data: Dict[str, Any]) -> Dict[str, str]:
         """Automatically discover image fields in product data"""
@@ -208,8 +305,8 @@ class FieldMappingService:
         all_attributes = self.extract_all_attributes_dynamically(product_dict)
         
         # Also check direct attributes for backward compatibility
-        attributes = product_dict.get('attributes', {})
-        detailed_attributes = product_dict.get('detailed_attributes', {})
+        attributes = product_dict.get('attributes', {}) or {}
+        detailed_attributes = product_dict.get('detailed_attributes', {}) or {}
         
         # Merge all sources, prioritizing dynamic discovery
         field_source = {**attributes, **detailed_attributes, **all_attributes}
@@ -258,7 +355,22 @@ class FieldMappingService:
                 raw_value = product_dict[plytix_field]
                 source = "top_level"
             
-            if raw_value is not None and raw_value != "":
+            # Always check if field should be cleared first, regardless of value
+            logger.warning("CHECKING FIELD FOR CLEARING", 
+                          plytix_field=plytix_field, 
+                          field_type=mapping.field_type.value,
+                          clearable=mapping.clearable)
+            should_clear = self._should_clear_field(plytix_field, raw_value, mapping, combined_dict)
+            
+            if should_clear:
+                # Use empty string to clear PDF field (confirmed working in Postman)
+                all_mapped_fields[mapping.webflow_field] = ""
+                logger.warning("Safely clearing field in Webflow using empty string", 
+                              plytix_field=plytix_field,
+                              webflow_field=mapping.webflow_field,
+                              field_type=mapping.field_type.value,
+                              reason="Field explicitly marked for clearing")
+            elif raw_value is not None and raw_value != "":
                 transformed_value = self._transform_field_value(raw_value, mapping)
                 
                 if transformed_value is not None and transformed_value != "":
@@ -298,8 +410,19 @@ class FieldMappingService:
                        skipped_count=len(skipped_fields),
                        skipped_fields=skipped_fields)
         
+        # FORCED INCLUSION: Add cleared PDF fields with empty strings
+        self._force_include_cleared_pdf_fields(all_mapped_fields, combined_dict)
+        
+        logger.warning("BEFORE_SEPARATION_DEBUG: Fields about to be separated", 
+                      all_fields=list(all_mapped_fields.keys()),
+                      field_count=len(all_mapped_fields))
+        
         # Separate fields into product-level and SKU-level
         webflow_data, sku_data = WebflowFieldSeparator.separate_fields(all_mapped_fields)
+        
+        logger.warning("AFTER_SEPARATION_DEBUG: Fields after separation", 
+                      product_fields=list(webflow_data.keys()),
+                      sku_fields=list(sku_data.keys()))
         
         # Store SKU data for later use
         self._last_sku_data = sku_data
@@ -662,7 +785,22 @@ class FieldMappingService:
             elif plytix_field in plytix_product_data:
                 raw_value = plytix_product_data[plytix_field]
             
-            if raw_value is not None and raw_value != "":
+            # Always check if field should be cleared first, regardless of value
+            logger.warning("CHECKING FIELD FOR CLEARING", 
+                          plytix_field=plytix_field, 
+                          field_type=mapping.field_type.value,
+                          clearable=mapping.clearable)
+            should_clear = self._should_clear_field(plytix_field, raw_value, mapping, combined_dict)
+            
+            if should_clear:
+                # Use empty string to clear PDF field (confirmed working in Postman)
+                all_mapped_fields[mapping.webflow_field] = ""
+                logger.warning("Safely clearing SKU field in Webflow using empty string", 
+                              plytix_field=plytix_field,
+                              webflow_field=mapping.webflow_field,
+                              field_type=mapping.field_type.value,
+                              reason="Field explicitly marked for clearing")
+            elif raw_value is not None and raw_value != "":
                 transformed_value = self._transform_field_value(raw_value, mapping)
                 if transformed_value is not None and transformed_value != "":
                     all_mapped_fields[mapping.webflow_field] = transformed_value
