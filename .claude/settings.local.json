@@ -38,7 +38,9 @@
       "Bash(open:*)",
       "WebFetch(domain:docs.plytix.com)",
       "Bash(sed:*)",
-      "WebFetch(domain:docs.developers.webflow.com)"
+      "WebFetch(domain:docs.developers.webflow.com)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ],
     "deny": []
   }

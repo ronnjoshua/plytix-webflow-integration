@@ -1,7 +1,8 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 from datetime import datetime
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
 
 from app.clients.plytix_client import PlytixClient
 from app.clients.webflow_client import WebflowClient
@@ -9,6 +10,7 @@ from app.services.variant_service import VariantService
 from app.services.transform_service import TransformService
 from app.services.collection_mapping_service import CollectionMappingService
 from app.services.field_mapping_service import FieldMappingService
+from app.services.cache_service import CacheService
 from app.models.database import SyncState, ProductMapping, VariantMapping, SyncError
 from app.models.plytix import PlytixProduct
 from app.core.exceptions import SyncError as SyncException
@@ -28,12 +30,14 @@ class SyncService:
         self.transform_service = TransformService()
         self.collection_mapping_service = CollectionMappingService(db, self.webflow_client)
         self.field_mapping_service = FieldMappingService(webflow_client=self.webflow_client)
+        self.cache_service = CacheService()
     
     async def close(self):
         """Close the API clients."""
         await self.plytix_client.close()
         await self.webflow_client.close()
         await self.field_mapping_service.asset_handler.close()
+        await self.cache_service.close()
     
     async def run_full_sync(self, test_mode: bool = False) -> SyncState:
         """Run complete synchronization from Plytix to Webflow"""
@@ -60,31 +64,49 @@ class SyncService:
                 since=None  # Disable delta sync for testing
             )
             
-            # Process products in batches
+            # OPTIMIZATION: Bulk check product existence first
+            all_skus = [self.field_mapping_service.get_sku_from_product(product.__dict__) for product in plytix_products]
+            logger.info("Performing bulk product existence check", total_products=len(all_skus))
+            
+            webflow_products_mapping = await self.webflow_client.bulk_check_products_exist(all_skus)
+            
+            # Filter products: only process those that exist in Webflow (UPDATE_ONLY_MODE)
+            products_to_process = []
+            skipped_count = 0
+            
+            for product in plytix_products:
+                product_sku = self.field_mapping_service.get_sku_from_product(product.__dict__)
+                if webflow_products_mapping.get(product_sku):
+                    products_to_process.append(product)
+                else:
+                    skipped_count += 1
+                    logger.debug("Skipping product - not found in Webflow", sku=product_sku)
+            
+            logger.info("Bulk check completed", 
+                       total_products=len(all_skus),
+                       found_in_webflow=len(products_to_process),
+                       skipped=skipped_count)
+            
+            # Process products in batches with optimizations
             batch_size = 10 if test_mode else 50
             processed_count = 0
             variant_count = 0
             error_count = 0
             updated_product_ids = []  # Track updated products for batch publishing
             
-            for i in range(0, len(plytix_products), batch_size):
-                batch = plytix_products[i:i + batch_size]
+            for i in range(0, len(products_to_process), batch_size):
+                batch = products_to_process[i:i + batch_size]
                 
-                for product in batch:
-                    try:
-                        result = await self._sync_single_product(product, sync_state)
-                        if result and result.get("webflow_id"):
-                            processed_count += 1
-                            variant_count += len(product.variants)
-                            updated_product_ids.append(result["webflow_id"])
-                        
-                    except Exception as e:
+                # Process batch concurrently (with limited concurrency to avoid overwhelming APIs)
+                batch_results = await self._process_batch_concurrent(batch, sync_state, webflow_products_mapping)
+                
+                for result in batch_results:
+                    if result.get("success") and result.get("webflow_id"):
+                        processed_count += 1
+                        variant_count += result.get("variant_count", 0)
+                        updated_product_ids.append(result["webflow_id"])
+                    elif result.get("error"):
                         error_count += 1
-                        await self._log_error(sync_state, product, str(e))
-                        logger.error("Failed to sync product", 
-                                   product_id=product.id, 
-                                   sku=product.sku, 
-                                   error=str(e))
                 
                 # Update progress
                 sync_state.products_processed = processed_count
@@ -133,6 +155,178 @@ class SyncService:
             
             logger.error("Sync failed", error=str(e))
             raise SyncException(f"Sync failed: {str(e)}")
+    
+    async def _process_batch_concurrent(self, 
+                                      batch: List[PlytixProduct], 
+                                      sync_state: SyncState,
+                                      webflow_products_mapping: Dict[str, Optional[str]]) -> List[Dict]:
+        """Process a batch of products concurrently with controlled concurrency"""
+        
+        # Limit concurrency to avoid overwhelming the APIs
+        semaphore = asyncio.Semaphore(3)  # Max 3 concurrent product syncs
+        
+        async def sync_with_semaphore(product: PlytixProduct) -> Dict:
+            async with semaphore:
+                try:
+                    # Get webflow_id from bulk check results
+                    product_sku = self.field_mapping_service.get_sku_from_product(product.__dict__)
+                    webflow_id = webflow_products_mapping.get(product_sku)
+                    
+                    if not webflow_id:
+                        return {"success": False, "error": "Product not found in Webflow"}
+                    
+                    result = await self._sync_single_product_optimized(product, sync_state, webflow_id)
+                    if result and result.get("webflow_id"):
+                        return {
+                            "success": True,
+                            "webflow_id": result["webflow_id"],
+                            "variant_count": len(product.variants),
+                            "action": result.get("action", "updated")
+                        }
+                    else:
+                        return {"success": False, "error": "Sync returned no result"}
+                        
+                except Exception as e:
+                    await self._log_error(sync_state, product, str(e))
+                    logger.error("Failed to sync product in batch", 
+                               product_id=product.id, 
+                               sku=product.sku, 
+                               error=str(e))
+                    return {"success": False, "error": str(e)}
+        
+        # Execute all product syncs concurrently
+        tasks = [sync_with_semaphore(product) for product in batch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle any exceptions that occurred
+        processed_results = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                await self._log_error(sync_state, batch[i], str(result))
+                processed_results.append({"success": False, "error": str(result)})
+            else:
+                processed_results.append(result)
+        
+        return processed_results
+    
+    async def _sync_single_product_optimized(self, 
+                                           product: PlytixProduct, 
+                                           sync_state: SyncState,
+                                           webflow_id: str) -> Optional[Dict]:
+        """Optimized version of single product sync with caching"""
+        
+        logger.debug("Starting optimized sync for product", 
+                    product_id=product.id, 
+                    product_sku=product.sku,
+                    webflow_id=webflow_id)
+        
+        # Validate product data
+        is_valid, validation_errors = self.variant_service.validate_variant_data(product)
+        if not is_valid:
+            await self._log_error(sync_state, product, f"Validation errors: {validation_errors}")
+            return None
+        
+        # Determine target collection for this product
+        target_collection_id = await self.collection_mapping_service.get_collection_for_product(product)
+        
+        # Check cache for content hash to avoid unnecessary updates
+        product_content = product.model_dump() if hasattr(product, 'model_dump') else product.__dict__
+        current_hash = self.cache_service.generate_content_hash(product_content)
+        cached_hash = await self.cache_service.get_product_hash(product.id)
+        
+        if cached_hash == current_hash:
+            logger.debug("Product content unchanged, skipping sync", 
+                        product_id=product.id, 
+                        sku=product.sku)
+            return {"webflow_id": webflow_id, "action": "skipped"}
+        
+        # Extract variant attributes and create SKU properties
+        if product.variants:
+            attributes_map = self.variant_service.extract_variant_attributes(product.variants)
+            sku_properties = self.variant_service.create_sku_properties(attributes_map)
+            sku_matrix = self.variant_service.generate_sku_matrix(product, sku_properties)
+        else:
+            sku_properties = []
+            sku_matrix = self.variant_service.generate_sku_matrix(product, [])
+        
+        # Process product assets with caching
+        processed_assets = await self._process_assets_with_cache(product)
+        
+        # Transform to Webflow format using enhanced field mapping
+        logger.debug("Transforming product data", product_id=product.id)
+        webflow_data = self.field_mapping_service.transform_product_data(product)
+        
+        # Merge processed assets into webflow_data
+        webflow_data.update(processed_assets)
+        
+        webflow_product = self.transform_service.transform_product(
+            product, sku_properties, sku_matrix, webflow_data
+        )
+        
+        try:
+            # Update existing product - we know it exists from bulk check
+            plytix_data = product.model_dump() if hasattr(product, 'model_dump') else product.__dict__
+            updated_product = await self.webflow_client.update_product(
+                webflow_id, webflow_product, plytix_product_data=plytix_data, collection_id=target_collection_id
+            )
+            
+            await self._update_product_mapping(product, updated_product.id, target_collection_id)
+            logger.debug("Updated existing product", 
+                       sku=product.sku, 
+                       webflow_id=updated_product.id,
+                       collection_id=target_collection_id)
+            
+            # Update variant mappings
+            await self._update_variant_mappings(product)
+            
+            # Cache the new content hash
+            await self.cache_service.cache_product_hashes({product.id: current_hash}, ttl_minutes=60)
+            
+            return {"webflow_id": updated_product.id, "action": "updated"}
+            
+        except Exception as e:
+            logger.error("Failed to sync product to Webflow", 
+                        product_id=product.id, 
+                        sku=product.sku, 
+                        error=str(e))
+            raise
+    
+    async def _process_assets_with_cache(self, product: PlytixProduct) -> Dict:
+        """Process product assets with caching"""
+        try:
+            # Check cache first
+            cached_assets = await self.cache_service.get_product_assets(product.id)
+            if cached_assets:
+                logger.debug("Using cached assets", product_id=product.id)
+                return {"cached_assets": True}  # Indicate assets were cached
+            
+            # Process assets normally
+            plytix_data = product.model_dump() if hasattr(product, 'model_dump') else product.__dict__
+            processed_assets = await self.field_mapping_service.process_product_assets(
+                plytix_data, 
+                use_webflow_upload=True
+            )
+            
+            # Cache the processed assets
+            if processed_assets:
+                await self.cache_service.cache_product_assets(
+                    product.id, 
+                    [processed_assets], 
+                    ttl_minutes=120
+                )
+            
+            return processed_assets
+            
+        except Exception as e:
+            logger.warning("Failed to process assets with cache", 
+                         product_id=product.id, 
+                         error=str(e))
+            # Fallback to normal processing
+            plytix_data = product.model_dump() if hasattr(product, 'model_dump') else product.__dict__
+            return await self.field_mapping_service.process_product_assets(
+                plytix_data, 
+                use_webflow_upload=True
+            )
     
     async def _sync_single_product(self, product: PlytixProduct, sync_state: SyncState) -> bool:
         """Sync a single product with all its variants"""

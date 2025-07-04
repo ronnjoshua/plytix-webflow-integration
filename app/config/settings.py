@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     PLYTIX_API_KEY: str = Field(default="test_key", description="Plytix API Key")
     PLYTIX_API_PASSWORD: str = Field(default="test_password", description="Plytix API Password")
     PLYTIX_BASE_URL: str = Field(default="https://pim.plytix.com/api/v1")
-    PLYTIX_RATE_LIMIT: int = Field(default=50, description="Requests per 10 seconds")
+    PLYTIX_RATE_LIMIT: int = Field(default=15, description="Requests per 10 seconds")
     
     # Webflow Configuration
     WEBFLOW_TOKEN: str = Field(default="test_token", description="Webflow API Token")

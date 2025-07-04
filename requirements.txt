@@ -15,6 +15,7 @@ asyncpg>=0.29.0
 # Task Scheduling & Background Jobs
 celery>=5.3.0
 redis>=5.0.0
+redis[hiredis]>=5.0.0
 flower>=2.0.0
 
 # Data Processing & Validation

@@ -5,7 +5,7 @@ import structlog
 import os
 
 from app.config.settings import get_settings
-from app.api.routes import health, sync, monitoring, collections, field_mappings
+from app.api.routes import health, sync, monitoring, collections, field_mappings, cache
 from app.core.logging import setup_logging
 # from app.tasks.celery_app import celery_app  # Import only when needed
 
@@ -52,6 +52,7 @@ app.include_router(sync.router, prefix="/sync", tags=["synchronization"])
 app.include_router(monitoring.router, prefix="/monitoring", tags=["monitoring"])
 app.include_router(collections.router, prefix="/collections", tags=["collections"])
 app.include_router(field_mappings.router, prefix="/field-mappings", tags=["field-mappings"])
+app.include_router(cache.router, prefix="/cache", tags=["cache"])
 
 if __name__ == "__main__":
     import uvicorn

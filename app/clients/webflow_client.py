@@ -9,6 +9,7 @@ from app.config.endpoints import webflow_api
 from app.models.webflow import WebflowProduct, WebflowProductResponse
 from app.utils.rate_limiter import RateLimiter
 from app.core.exceptions import WebflowAPIError
+from app.services.cache_service import CacheService
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -26,10 +27,13 @@ class WebflowClient:
             time_window=60  # 60 seconds
         )
         self._client = httpx.AsyncClient(timeout=30.0)
+        self.cache_service = CacheService()
+        self._products_cache_initialized = False
     
     async def close(self):
         """Close the underlying HTTP client."""
         await self._client.aclose()
+        await self.cache_service.close()
 
     async def check_authentication(self) -> bool:
         """Verify that the Webflow token is valid."""
@@ -434,7 +438,11 @@ class WebflowClient:
                     try:
                         current_sku_info = await self._make_request(sku_endpoint)
                         current_sku_fields = current_sku_info.get("fieldData", {})
-                    except:
+                    except Exception as e:
+                        logger.warning("Failed to get current SKU data", 
+                                     product_id=product_id, 
+                                     sku_id=default_sku_id, 
+                                     error=str(e))
                         # If we can't get current SKU data, proceed with update
                         current_sku_fields = {}
                     
@@ -542,7 +550,19 @@ class WebflowClient:
                     }
                     if updated_fields:
                         logger.debug("Updating SKU (Webflow PATCH body)", sku_id=default_sku_id, patch_body=sku_patch_body)
-                        await self._make_request(sku_endpoint, method="PATCH", json_data=sku_patch_body)
+                        try:
+                            await self._make_request(sku_endpoint, method="PATCH", json_data=sku_patch_body)
+                        except WebflowAPIError as e:
+                            if "409" in str(e) or "conflict" in str(e).lower():
+                                logger.warning("Webflow variant conflict - SKU structure mismatch", 
+                                             product_id=product_id,
+                                             sku_id=default_sku_id,
+                                             error_details=str(e),
+                                             suggestion="Product may need variant options configured in Webflow")
+                                # Don't fail the entire sync for variant conflicts
+                                updated_fields = [f"{field}(conflict)" for field in updated_fields]
+                            else:
+                                raise
                     else:
                         logger.debug("No SKU changes detected - skipping SKU update", sku_id=default_sku_id)
                     
@@ -575,9 +595,65 @@ class WebflowClient:
                 updated_on=data.get("updated_on", "")
             )
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def _initialize_products_cache(self) -> None:
+        """Initialize products cache by fetching all products once"""
+        if self._products_cache_initialized:
+            return
+        
+        try:
+            logger.info("Initializing products cache")
+            products = await self.get_all_products_from_collection()
+            
+            # Convert to dict format for caching
+            product_dicts = []
+            for product in products:
+                product_dict = {
+                    "id": product.id,
+                    "fieldData": {
+                        "name": product.name,
+                        "slug": product.slug
+                    },
+                    "createdOn": product.created_on,
+                    "updatedOn": product.updated_on
+                }
+                product_dicts.append(product_dict)
+            
+            await self.cache_service.cache_webflow_products(product_dicts, ttl_minutes=30)
+            self._products_cache_initialized = True
+            
+            logger.info("Products cache initialized", count=len(products))
+            
+        except Exception as e:
+            logger.warning("Failed to initialize products cache", error=str(e))
+    
     async def get_product_by_sku(self, sku: str, collection_id: Optional[str] = None) -> Optional[WebflowProductResponse]:
-        """Find product by SKU in the collection"""
+        """Find product by SKU using cache first, then fallback to API"""
+        try:
+            # Try cache first
+            await self._initialize_products_cache()
+            
+            cached_product = await self.cache_service.get_webflow_product_by_name(sku)
+            if cached_product:
+                logger.debug("Found product in cache", sku=sku, product_id=cached_product.get("id"))
+                return WebflowProductResponse(
+                    id=cached_product.get("id", ""),
+                    name=cached_product.get("fieldData", {}).get("name", ""),
+                    slug=cached_product.get("fieldData", {}).get("slug", ""),
+                    created_on=cached_product.get("createdOn", ""),
+                    updated_on=cached_product.get("updatedOn", "")
+                )
+            
+            # Fallback to API search (original logic)
+            logger.debug("Product not in cache, searching API", sku=sku)
+            return await self._get_product_by_sku_from_api(sku, collection_id)
+            
+        except Exception as e:
+            logger.warning("Failed to find product by SKU", sku=sku, error=str(e))
+            return None
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def _get_product_by_sku_from_api(self, sku: str, collection_id: Optional[str] = None) -> Optional[WebflowProductResponse]:
+        """Find product by SKU in the collection using API"""
         endpoint = self.endpoints.products.list_products_url(self.site_id).replace(self.base_url, "")
         
         # According to Webflow API v2, we get all products and search by product name (matching Plytix SKU)
@@ -586,7 +662,7 @@ class WebflowClient:
         }
         
         try:
-            logger.debug("Searching for product by SKU", sku=sku)
+            logger.debug("Searching for product by SKU via API", sku=sku)
             
             offset = 0
             while True:
@@ -632,6 +708,32 @@ class WebflowClient:
         except Exception as e:
             logger.warning("Failed to find product by SKU", sku=sku, error=str(e))
             return None
+    
+    async def bulk_check_products_exist(self, skus: List[str]) -> Dict[str, Optional[str]]:
+        """Bulk check which products exist in Webflow and return SKU -> product_id mapping"""
+        try:
+            # Initialize cache if needed
+            await self._initialize_products_cache()
+            
+            result = {}
+            
+            for sku in skus:
+                cached_product = await self.cache_service.get_webflow_product_by_name(sku)
+                if cached_product:
+                    result[sku] = cached_product.get("id")
+                else:
+                    result[sku] = None
+            
+            logger.info("Bulk checked products existence", 
+                       total_skus=len(skus), 
+                       found_count=len([v for v in result.values() if v is not None]))
+            
+            return result
+            
+        except Exception as e:
+            logger.warning("Failed to bulk check products", error=str(e))
+            # Return empty dict, sync will handle individual lookups
+            return {}
 
     async def get_all_products_from_collection(self, collection_id: Optional[str] = None) -> List[WebflowProductResponse]:
         """Get all products from the collection"""
