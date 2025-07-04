@@ -1,4 +1,5 @@
 import httpx
+import asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -201,36 +202,70 @@ class PlytixClient:
         page: int = 1,
         page_size: int = 25,
         attributes: list = None,
-        filters: dict = None
+        filters: list = None,
+        status: str = None
     ) -> dict:
-        """Search products using POST /products/search and return the raw response."""
+        """Search products using POST /products/search and return the raw response.
+        
+        Based on Plytix API documentation:
+        - filters should be an array of arrays of filter objects
+        - Each filter object has: {"field": "...", "operator": "...", "value": "..."}
+        - OR logic between array elements, AND logic within arrays
+        
+        Args:
+            page: Page number (1-based)
+            page_size: Number of products per page
+            attributes: List of attribute names to include in response
+            filters: Array of filter arrays for custom filtering
+            status: Product status to filter by (e.g., "completed", "draft", "in_review")
+        """
         endpoint = self.endpoints.products.SEARCH
         
-        # Build request body with minimal structure for Plytix API
+        # Build request body according to Plytix API documentation
         body = {
             "pagination": {
                 "page": page,
                 "page_size": page_size
-            },
-            "sorting": {
-                "field": "updated_at",
-                "direction": "desc"
             }
         }
         
-        # Add attributes if provided (but this might not be needed for basic search)
+        # Add sorting only if needed (optional according to docs)
+        body["pagination"]["order"] = "-modified"  # Sort by modified date descending
+        
+        # Add attributes if provided
         if attributes and isinstance(attributes, list) and len(attributes) > 0:
             body["attributes"] = attributes
-            
-        # Add filters if provided - use proper Plytix filter structure
-        if filters and isinstance(filters, dict):
-            body["filters"] = filters
-        elif filters and isinstance(filters, list) and len(filters) > 0:
-            # Convert list of filters to proper Plytix format
-            body["filters"] = {"and": filters}
+        
+        # Build filters array - always use array of arrays format
+        all_filters = []
+        
+        # Add status filter if provided (only if products actually have status field)
+        if status:
+            status_filter = [{
+                "field": "status",
+                "operator": "eq",
+                "value": status
+            }]
+            all_filters.append(status_filter)
+            logger.info("Adding status filter to Plytix search", status=status)
+        
+        # Add custom filters if provided
+        if filters and isinstance(filters, list) and len(filters) > 0:
+            # filters should be array of arrays of filter conditions
+            # If we get a simple list of conditions, wrap in array for AND logic
+            if all(isinstance(f, dict) and "field" in f for f in filters):
+                # List of filter objects - wrap in array for AND logic
+                all_filters.append(filters)
+            else:
+                # Already in correct format (array of arrays) - extend our list
+                all_filters.extend(filters)
+        
+        # Apply filters if we have any
+        if all_filters:
+            body["filters"] = all_filters
         
         # Debug logging to see exact request
-        logger.debug("Plytix search request body", body=body)
+        logger.warning("Plytix search request body", body=body)
         return await self._make_request(endpoint, method="POST", json_data=body)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -289,24 +324,109 @@ class PlytixClient:
         since: Optional[str] = None,
         catalog_id: Optional[str] = None
     ) -> List[PlytixProduct]:
-        """Fetch all products with their variants using the search endpoint"""
+        """Fetch all products with their variants using optimized bulk approach"""
+        from app.services.cache_service import CacheService
+        
+        cache_service = CacheService()
+        try:
+            # Check cache first
+            cache_key = f"plytix_products_{since or 'all'}_{catalog_id or 'all'}"
+            cached_products = await cache_service.get_api_response(cache_key)
+            
+            if cached_products:
+                logger.info("Using cached Plytix products", count=len(cached_products))
+                return cached_products
+            
+            # Fetch products with optimized approach
+            all_products = await self._fetch_products_bulk_optimized(since, catalog_id)
+            
+            # Cache the results
+            if all_products:
+                await cache_service.cache_api_response(cache_key, all_products, ttl_minutes=15)
+            
+            return all_products
+            
+        finally:
+            await cache_service.close()
+    
+    async def _fetch_products_bulk_optimized(
+        self, 
+        since: Optional[str] = None,
+        catalog_id: Optional[str] = None
+    ) -> List[PlytixProduct]:
+        """Optimized bulk fetching with rate limiting and batching"""
         all_products = []
         page = 1
-        page_size = 25
+        page_size = 25  # Keep reasonable to avoid timeouts
         
-        logger.info("Fetching products from Plytix", since=since, catalog_id=catalog_id)
+        logger.info("Fetching products from Plytix (optimized)", since=since, catalog_id=catalog_id)
+        
+        # Step 1: Fetch basic product list first
+        basic_products = await self._fetch_basic_products_list(since, catalog_id)
+        
+        if not basic_products:
+            logger.info("No products found")
+            return []
+        
+        logger.info("Found products, enriching with details", count=len(basic_products))
+        
+        # Step 2: Batch enrich products to minimize API calls
+        batch_size = 5  # Process 5 products at a time to respect rate limits
+        
+        for i in range(0, len(basic_products), batch_size):
+            batch = basic_products[i:i + batch_size]
+            
+            # Process batch with controlled concurrency
+            enriched_batch = await self._enrich_products_batch(batch, catalog_id)
+            all_products.extend(enriched_batch)
+            
+            # Log progress
+            logger.info("Processed product batch", 
+                       batch_start=i, 
+                       batch_size=len(batch),
+                       total_processed=len(all_products),
+                       total_products=len(basic_products))
+            
+            # Add small delay between batches to respect rate limits
+            if i + batch_size < len(basic_products):
+                await asyncio.sleep(1)  # 1 second between batches
+        
+        logger.info("Completed optimized product fetch", total_count=len(all_products))
+        return all_products
+    
+    async def _fetch_basic_products_list(
+        self, 
+        since: Optional[str] = None,
+        catalog_id: Optional[str] = None
+    ) -> List[Dict]:
+        """Fetch basic product list without enrichment"""
+        all_products = []
+        page = 1
+        page_size = 50  # Larger page size for basic list
         
         while True:
             try:
-                # Build filters for the search endpoint
-                filters = {}
+                # Build filters in correct Plytix format: array of arrays
+                filters = None
                 filter_conditions = []
                 
                 if since:
+                    # Convert since to proper date format if it's a datetime
+                    if hasattr(since, 'strftime'):
+                        since_formatted = since.strftime("%Y-%m-%d")
+                    else:
+                        # Assume it's already a string, try to parse and reformat
+                        try:
+                            from datetime import datetime
+                            dt = datetime.fromisoformat(since.replace('Z', '+00:00'))
+                            since_formatted = dt.strftime("%Y-%m-%d")
+                        except:
+                            since_formatted = since
+                    
                     filter_conditions.append({
-                        "field": "updated_at",
-                        "operator": "gte", 
-                        "value": since
+                        "field": "modified",  # Use 'modified' as per Plytix docs
+                        "operator": "gt", 
+                        "value": since_formatted
                     })
                     
                 if catalog_id:
@@ -316,48 +436,24 @@ class PlytixClient:
                         "value": catalog_id
                     })
                 
-                # Set up filters properly for Plytix API
+                # Only set filters if we have conditions - use array of arrays format
                 if filter_conditions:
-                    filters = {"and": filter_conditions}
+                    filters = [filter_conditions]  # Wrap in array for AND logic
                 
-                # Use the search endpoint with proper filter structure
+                # Use the search endpoint
                 response_data = await self.search_products(
                     page=page, 
                     page_size=page_size,
-                    filters=filters if filter_conditions else None
+                    filters=filters
                 )
                 
                 # Check if we have results - Plytix API returns data in 'data' field
                 products_data = response_data.get("data", [])
                 if not products_data:
-                    logger.info("No more products found", page=page)
+                    logger.info("No more products found in basic list", page=page)
                     break
                     
-                logger.info("Processing products page", page=page, products_count=len(products_data))
-                
-                for product_data in products_data:
-                    try:
-                        product = PlytixProduct(**product_data)
-                        
-                        # Enrich product with detailed information
-                        await self._enrich_product_details(product)
-                        
-                        # Fetch variants for each product
-                        try:
-                            variants = await self.get_product_variants(product.id, catalog_id)
-                            product.variants = variants
-                            logger.debug("Fetched variants for product", 
-                                       product_id=product.id, 
-                                       variants_count=len(variants))
-                        except Exception as e:
-                            logger.warning("Failed to fetch variants", product_id=product.id, error=str(e))
-                            product.variants = []  # Ensure variants is always a list
-                        
-                        all_products.append(product)
-                        
-                    except Exception as e:
-                        logger.error("Failed to process product", product_data=product_data, error=str(e))
-                        continue
+                all_products.extend(products_data)
                 
                 # Check if there are more pages
                 pagination = response_data.get("pagination", {})
@@ -365,15 +461,9 @@ class PlytixClient:
                 total_count = pagination.get("total_count", 0)
                 current_page_size = pagination.get("page_size", page_size)
                 
-                logger.debug("Pagination info", 
-                           current_page=current_page, 
-                           total_count=total_count, 
-                           page_size=current_page_size,
-                           products_so_far=len(all_products))
-                
                 # Calculate if we've reached the end
                 if current_page * current_page_size >= total_count or len(products_data) < page_size:
-                    logger.info("Reached end of products", 
+                    logger.info("Reached end of basic product list", 
                               final_page=current_page, 
                               total_products=len(all_products))
                     break
@@ -381,15 +471,60 @@ class PlytixClient:
                 page += 1
                 
             except Exception as e:
-                logger.error("Failed to fetch products page", page=page, error=str(e))
-                # Don't break on individual page failures, try next page
-                page += 1
-                if page > 10:  # Prevent infinite loop
-                    logger.error("Too many consecutive failures, stopping")
-                    break
-                
-        logger.info("Fetched products from Plytix", count=len(all_products))
+                logger.error("Failed to fetch basic products page", page=page, error=str(e))
+                break
+        
         return all_products
+    
+    async def _enrich_products_batch(self, products_data: List[Dict], catalog_id: Optional[str] = None) -> List[PlytixProduct]:
+        """Enrich a batch of products with controlled concurrency"""
+        import asyncio
+        
+        # Limit concurrent enrichment to respect rate limits
+        semaphore = asyncio.Semaphore(2)  # Max 2 concurrent enrichments
+        
+        async def enrich_single_product(product_data: Dict) -> Optional[PlytixProduct]:
+            async with semaphore:
+                try:
+                    product = PlytixProduct(**product_data)
+                    
+                    # Add small delay between individual calls
+                    await asyncio.sleep(0.5)
+                    
+                    # Enrich product with detailed information
+                    await self._enrich_product_details(product)
+                    
+                    # Fetch variants (with additional delay)
+                    await asyncio.sleep(0.3)
+                    try:
+                        variants = await self.get_product_variants(product.id, catalog_id)
+                        product.variants = variants
+                        logger.debug("Fetched variants for product", 
+                                   product_id=product.id, 
+                                   variants_count=len(variants))
+                    except Exception as e:
+                        logger.warning("Failed to fetch variants", product_id=product.id, error=str(e))
+                        product.variants = []
+                    
+                    return product
+                    
+                except Exception as e:
+                    logger.error("Failed to enrich product", product_data=product_data, error=str(e))
+                    return None
+        
+        # Process all products in the batch concurrently
+        tasks = [enrich_single_product(product_data) for product_data in products_data]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Filter out None results and exceptions
+        enriched_products = []
+        for result in results:
+            if isinstance(result, PlytixProduct):
+                enriched_products.append(result)
+            elif isinstance(result, Exception):
+                logger.error("Exception during product enrichment", error=str(result))
+        
+        return enriched_products
     
     async def _enrich_product_details(self, product: PlytixProduct) -> None:
         """Enrich a product with detailed information from the product details endpoint"""
